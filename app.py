@@ -220,7 +220,7 @@ def main():
         max_players = st.number_input("Max players", 1, 9, 6)
         min_bet = st.number_input("Min bet", 1, 1_000_000, 10)
         starting_bankroll = st.number_input("Starting bankroll", 1, 10_000_000, 1000)
-        if st.button("Create"):
+        if st.button("Create", key="btn_create"):
             code = gen_code()
             now = int(time.time())
             room = {
@@ -242,7 +242,7 @@ def main():
 
         st.subheader("Join room")
         room_code = st.text_input("Room code", value=st.session_state.get("room_code", "")).upper()
-        if st.button("Join") and room_code:
+        if st.button("Join", key="btn_join") and room_code:
             room = db_get_room(room_code)
             if not room:
                 st.error("Room not found")
@@ -317,7 +317,7 @@ def main():
             ready_players = [uid for uid in room["order"] if room["users"][uid].get("ready")]
             if len(ready_players) == 0:
                 st.info("Wait for at least one player to be Ready.")
-            if st.button("Start round", disabled=len(ready_players) == 0):
+            if st.button("Start round", disabled=len(ready_players) == 0, key=f"btn_start_{room_code}"):
                 # Robust start with optimistic retry
                 started = False
                 for _ in range(2):
@@ -339,7 +339,9 @@ def main():
                         "status": latest["status"],
                         "users": latest["users"],
                         "deck": latest["deck"],
-                        "order": latest["order"]
+                        "order": latest["order"],
+                        "settled": False,
+                        "last_results": []
                     })
                     if ok:
                         started = True
@@ -375,7 +377,7 @@ def main():
         if me.get("role") == "player":
             pok, _ = is_pok(me["hand"]) if len(me["hand"]) == 2 else (False, 0)
             c1, c2 = st.columns(2)
-            if c1.button("Hit", disabled=me.get("acted") or len(me["hand"]) != 2 or pok):
+            if c1.button("Hit", key=f"btn_hit_{user_id}", disabled=me.get("acted") or len(me["hand"]) != 2 or pok):
                 latest = db_get_room(room_code)
                 # draw a card for me only if still 2 cards
                 if len(latest["users"][user_id]["hand"]) == 2:
@@ -384,7 +386,7 @@ def main():
                 if not db_patch_room(latest, {"users": latest["users"], "deck": latest["deck"]}):
                     st.warning("Conflict — refreshing")
                     st.rerun()
-            if c2.button("Stand", disabled=me.get("acted") or pok):
+            if c2.button("Stand", key=f"btn_stand_{user_id}", disabled=me.get("acted") or pok):
                 latest = db_get_room(room_code)
                 latest["users"][user_id]["acted"] = True
                 if not db_patch_room(latest, {"users": latest["users"]}):
@@ -419,7 +421,7 @@ def main():
         # Dealer controls: manual Draw / Stand
         if user_id == dealer_id:
             c1, c2 = st.columns(2)
-            if c1.button("Dealer: Draw"):
+            if c1.button("Dealer: Draw", key=f"btn_ddraw_{room_code}"):
                 latest = db_get_room(room_code)
                 if not latest:
                     st.error("Room missing"); return
@@ -428,7 +430,7 @@ def main():
                     latest["users"][dealer_id]["hand"].append(draw_card(latest))
                     db_patch_room(latest, {"users": latest["users"], "deck": latest["deck"]})
                 st.rerun()
-            if c2.button("Dealer: Stand / Go to Showdown"):
+            if c2.button("Dealer: Stand / Go to Showdown", key=f"btn_dstand_{room_code}"):
                 latest = db_get_room(room_code)
                 if not latest:
                     st.error("Room missing"); return
@@ -439,10 +441,52 @@ def main():
     # SHOWDOWN & SETTLEMENT
     elif room["status"] in ("showdown", "settlement"):
         latest = db_get_room(room_code)
-        results = settle_room(latest)
-        if not db_patch_room(latest, {"users": latest["users"], "status": latest["status"]}):
-            st.warning("Conflict — refreshing")
-            st.rerun()
+        if not latest:
+            st.error("Room missing")
+            return
+        # Idempotent settlement: only apply payouts once
+        if not latest.get("settled", False):
+            results = settle_room(latest)
+            latest["settled"] = True
+            latest["last_results"] = results
+            if not db_patch_room(latest, {"users": latest["users"], "status": latest["status"], "settled": True, "last_results": results}):
+                st.warning("Conflict — refreshing")
+                st.rerun()
+        else:
+            results = latest.get("last_results", [])
+
+        st.markdown("### Showdown")
+        # Reveal all hands now
+        dealer_cards = latest["users"][dealer_id]["hand"]
+        st.write(f"Dealer: {hand_to_str(dealer_cards)} — pts {hand_points(dealer_cards)}")
+        for uid in latest["order"]:
+            u = latest["users"][uid]
+            tag = " (me)" if uid == user_id else ""
+            st.write(f"👤 {u['name']}{tag} — {hand_to_str(u['hand'])} — pts {hand_points(u['hand'])}")
+
+        st.divider()
+        # Private P&L: show only my outcome
+        my_result = next((r for r in results if r.get("player_id") == user_id), None)
+        if my_result is not None:
+            icon = "✅" if my_result["outcome"] == "win" else ("❌" if my_result["outcome"] == "lose" else "⚖️")
+            st.success(f"My result: {icon} {my_result['outcome']} — payout {my_result['payout']}")
+            st.info(f"My updated bankroll: {latest['users'][user_id]['bankroll']}")
+        else:
+            st.caption("Results are private per player.")
+
+        if user_id == dealer_id and st.button("Back to Lobby", key=f"btn_back_{room_code}"):
+            latest = db_get_room(room_code)
+            if not latest:
+                st.error("Room missing")
+                return
+            for uid in latest["order"] + ([dealer_id] if dealer_id else []):
+                latest["users"][uid]["hand"] = []
+                latest["users"][uid]["acted"] = False
+                latest["users"][uid]["ready"] = False
+            latest["status"] = "lobby"
+            latest["settled"] = False
+            latest["last_results"] = []
+            db_patch_room(latest, {"users": latest["users"], "status": latest["status"], "settled": False, "last_results": []})
 
         st.markdown("### Showdown")
         # Reveal all hands now
