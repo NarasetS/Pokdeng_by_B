@@ -1,16 +1,21 @@
 # app.py — Pok Deng (ป๊อกเด้ง) Multiplayer — file-backed, identity persistence, Pok & Deng rules, real-time chat
-# Highlights:
+# New in this version:
+#  - 💬 Dealer "Clear chat now" button (always visible to dealer)
+#  - ⚡ Quick reaction buttons under chat input: Ready / Nice hand! / GG / 😂
+#  - Configurable chat limits (display/store caps)
+#
+# Highlights kept:
 # - Identity persistence: ?room=CODE&uid=TOKEN via st.query_params; reclaim-by-name on Join
 # - Heartbeat presence: last_seen; lobby shows 🟢 Active / 🟡 Away
 # - Full Pok & Deng rules; winner’s multiplier applies
 # - Auto-actions: player Pok (8/9) auto-acts; dealer Pok (8/9) auto-settles entire table
 # - Partial settlement flow: settle 3-card first, dealer draw, settle remaining
-# - Multiplier labels in UI (2 เด้ง, 3 เด้ง, ตอง, etc.) & results list
+# - Multiplier labels in UI (2 เด้ง, 3 เด้ง, ตอง, etc.) & detailed results
 # - Unique widget keys; auto-refresh every 5s
-# - 💬 Real-time chat (cleared automatically at Start Round; retains last 200 msgs)
 #
 # Requirements:
 #   pip install streamlit==1.48.1 streamlit-autorefresh==1.0.1 filelock==3.15.4
+# No external sources used.
 
 import os, json, time, uuid, random, datetime
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +23,15 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 from filelock import FileLock
 from streamlit_autorefresh import st_autorefresh
+
+# =========================
+# Tunables
+# =========================
+POLL_INTERVAL_MS = 2000        # chat/game auto-refresh
+ACTIVE_WINDOW = 20             # seconds for Active/Away
+CHAT_SHOW_MAX = 100            # how many msgs to render
+CHAT_STORE_MAX = 200           # how many msgs to keep in file
+QUICK_REACTIONS = ["Ready", "Nice hand!", "GG", "😂"]
 
 # =========================
 # Storage (file-backed)
@@ -68,7 +82,7 @@ def save_room(room: Dict) -> None:
     write_rooms(data)
 
 # =========================
-# Cards & Scoring (1..52 deck)
+# Cards & Scoring
 # =========================
 SUITS = ["♠", "♥", "♦", "♣"]
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
@@ -232,8 +246,6 @@ def settle_players(room: Dict, target_uids: List[str]) -> List[Dict]:
 # =========================
 # Identity helpers
 # =========================
-ACTIVE_WINDOW = 20  # seconds to consider "Active"
-
 def normalize_name(x: str) -> str:
     return (x or "").strip().lower()
 
@@ -256,8 +268,6 @@ def is_active(u: Dict) -> bool:
 # =========================
 # App
 # =========================
-POLL_INTERVAL_MS = 2000  # 5s
-
 def main():
     st.set_page_config(page_title="Pok Deng — Multiplayer", page_icon="🎴", layout="wide")
     st_autorefresh(interval=POLL_INTERVAL_MS, key="pokdeng-refresh")
@@ -335,7 +345,6 @@ def main():
                         room["users"][user_id_new]["name"] = name
                         save_room(room)
                     else:
-                        # create if not exists
                         if user_id not in room.get("users", {}):
                             room["users"][user_id] = {
                                 "name": name, "bankroll": 1000, "hand": [],
@@ -358,7 +367,6 @@ def main():
     room_code = st.session_state.get("room_code") or url_room
     if not room_code:
         left.info("Enter a room code and click Create or Join.")
-        # Show empty chat panel
         with right:
             st.subheader("💬 Table Chat")
             st.info("Join a room to start chatting.")
@@ -419,7 +427,6 @@ def main():
             st.divider()
             st.markdown("#### My settings")
             me = room["users"][user_id]
-            # clamp bet
             try:
                 current_bet = int(me.get("bet", 10))
             except Exception:
@@ -432,14 +439,12 @@ def main():
                 me["bet"] = int(bet_val); me["ready"] = bool(ready_val)
                 save_room(room); room = get_room(room_code)
 
-            # Dealer claim/reclaim
             if dealer_id is None and st.button("Become Dealer", key=f"btn_dealer_{room_code}"):
                 room = get_room(room_code)
                 room["dealer"] = user_id
                 save_room(room)
                 st.rerun()
 
-            # Reconnect link token
             st.caption(f"Your reconnect token: `{user_id}` — bookmark this page (URL now includes `?room={room_code}&uid={user_id}`)")
 
             if user_id == dealer_id and st.button("Start Round", key=f"btn_start_{room_code}"):
@@ -454,7 +459,6 @@ def main():
                         latest["deck"] = list(range(1, 53)); random.shuffle(latest["deck"])
                         latest["last_results"] = []; latest["settled_players"] = []
                         latest["chat"] = []  # 🔄 clear chat each round start
-                        # reset + deal
                         for uid, u in latest["users"].items():
                             u["hand"] = []; u["acted"] = False
                             try:
@@ -463,15 +467,13 @@ def main():
                                 u["bet"] = 10
                         for uid in ready_players:
                             latest["users"][uid]["hand"] = [draw_card(latest), draw_card(latest)]
-                            # player Pok -> acted immediately (lock)
                             p_pok, _ = is_pok(latest["users"][uid]["hand"])
                             if p_pok: latest["users"][uid]["acted"] = True
                         if dealer_id:
                             latest["users"][dealer_id]["hand"] = [draw_card(latest), draw_card(latest)]
-                            # Dealer Pok right after deal -> settle entire table now
                             d_pok, _ = is_pok(latest["users"][dealer_id]["hand"])
                             if d_pok:
-                                remaining = ready_players[:]  # all seated players
+                                remaining = ready_players[:]
                                 if remaining:
                                     settle_players(latest, remaining)
                                 latest["status"] = "settlement"
@@ -531,7 +533,6 @@ def main():
                 else:
                     st.write(f"Dealer: {facedown_str(len(dealer['hand']))}")
 
-                # If dealer has Pok now → auto-settle all remaining and end
                 if user_id == dealer_id and d_pok:
                     latest = get_room(room_code)
                     remaining = [uid for uid in latest["order"] if uid not in latest.get("settled_players", [])]
@@ -631,33 +632,54 @@ def main():
     # ======= Right: Real-time Chat =======
     with right:
         st.subheader("💬 Table Chat")
-        room = get_room(room_code)  # refresh to reflect new messages, if any
+
+        # Dealer admin action: clear chat now
+        room = get_room(room_code)
+        dealer_id = room.get("dealer")
+        if user_id == dealer_id:
+            if st.button("🧹 Clear chat now", key=f"btn_clear_chat_{room_code}"):
+                latest = get_room(room_code)
+                latest["chat"] = []
+                save_room(latest)
+                st.rerun()
+
+        # Render chat
+        room = get_room(room_code)  # refresh to reflect admin clears
         chat = room.get("chat", [])
-        # Show last 100 messages (newest at bottom)
-        for msg in chat[-100:]:
+
+        # Show up to CHAT_SHOW_MAX messages, newest at the top
+        for msg in reversed(chat[-CHAT_SHOW_MAX:]):
             ts = datetime.datetime.fromtimestamp(msg.get("ts", int(time.time()))).strftime("%H:%M:%S")
-            # Use chat bubbles
             with st.chat_message("user"):
                 st.markdown(f"**{msg.get('name','?')}** · {ts}\n\n{msg.get('text','')}")
 
-    # Chat input (fixed at bottom of the page). Only render if in a room.
-    message = st.chat_input("Type a message")
-    if message and room_code:
-        latest = get_room(room_code)
-        latest.setdefault("chat", [])
-        # prepare sender name
-        sender_name = latest["users"].get(user_id, {}).get("name", "Player")
-        latest["chat"].append({
-            "uid": user_id,
-            "name": sender_name,
-            "text": message.strip(),
-            "ts": int(time.time())
-        })
-        # cap chat history
-        if len(latest["chat"]) > 200:
-            latest["chat"] = latest["chat"][-200:]
-        save_room(latest)
-        st.rerun()
+        # Chat input + quick reactions
+        message = st.chat_input("Type a message")
+        # quick reactions row
+        cols = st.columns(len(QUICK_REACTIONS))
+        sent_reaction = None
+        for i, label in enumerate(QUICK_REACTIONS):
+            if cols[i].button(label, key=f"react_{label}_{room_code}"):
+                sent_reaction = label
+
+        to_send = message.strip() if message else None
+        if sent_reaction:
+            to_send = sent_reaction if not to_send else to_send
+
+        if to_send:
+            latest = get_room(room_code)
+            latest.setdefault("chat", [])
+            sender_name = latest["users"].get(user_id, {}).get("name", "Player")
+            latest["chat"].append({
+                "uid": user_id,
+                "name": sender_name,
+                "text": to_send,
+                "ts": int(time.time())
+            })
+            if len(latest["chat"]) > CHAT_STORE_MAX:
+                latest["chat"] = latest["chat"][-CHAT_STORE_MAX:]
+            save_room(latest)
+            st.rerun()
 
 if __name__ == "__main__":
     main()
