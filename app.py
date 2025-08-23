@@ -214,7 +214,7 @@ def settle_players(room: Dict, target_uids: List[str]) -> List[Dict]:
         p_pts = hand_points(p_hand)
         p_pok, _ = is_pok(p_hand)
         p_mult, p_lbl = deng_multiplier(p_hand)
-        bet = max(1, int(u.get("bet", 10)))
+        bet = max(1, int(u.get("bet", 1)))
 
         outcome, payout = settle_one(p_pts, p_pok, p_mult, d_pts, d_pok, d_mult, bet)
 
