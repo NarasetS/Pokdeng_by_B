@@ -1,4 +1,4 @@
-# app.py — Pok Deng (ป๊อกเด้ง) Multiplayer — file-backed, identity persistence, Pok & Deng rules
+# app.py — Pok Deng (ป๊อกเด้ง) Multiplayer — file-backed, identity persistence, Pok & Deng rules, real-time chat
 # Highlights:
 # - Identity persistence: ?room=CODE&uid=TOKEN via st.query_params; reclaim-by-name on Join
 # - Heartbeat presence: last_seen; lobby shows 🟢 Active / 🟡 Away
@@ -7,11 +7,12 @@
 # - Partial settlement flow: settle 3-card first, dealer draw, settle remaining
 # - Multiplier labels in UI (2 เด้ง, 3 เด้ง, ตอง, etc.) & results list
 # - Unique widget keys; auto-refresh every 5s
+# - 💬 Real-time chat (cleared automatically at Start Round; retains last 200 msgs)
 #
 # Requirements:
 #   pip install streamlit==1.48.1 streamlit-autorefresh==1.0.1 filelock==3.15.4
 
-import os, json, time, uuid, random
+import os, json, time, uuid, random, datetime
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -274,6 +275,9 @@ def main():
     st.title("🎴 Pok Deng — Multiplayer")
     st.caption("File-backed JSON storage; auto-refresh every 5s. (No external sources used.)")
 
+    # Layout: main + chat
+    left, right = st.columns([2, 1])
+
     # Sidebar: join/create
     with st.sidebar:
         st.header("Join or Create")
@@ -298,7 +302,8 @@ def main():
                     "users": {},
                     "order": [],
                     "last_results": [],
-                    "settled_players": []
+                    "settled_players": [],
+                    "chat": []
                 }
                 save_room(room)
                 st.session_state["room_code"] = room_code
@@ -352,12 +357,19 @@ def main():
     # Need a room
     room_code = st.session_state.get("room_code") or url_room
     if not room_code:
-        st.info("Enter a room code and click Create or Join.")
+        left.info("Enter a room code and click Create or Join.")
+        # Show empty chat panel
+        with right:
+            st.subheader("💬 Table Chat")
+            st.info("Join a room to start chatting.")
         return
 
     room = get_room(room_code)
     if not room:
-        st.error("Room not found or removed.")
+        left.error("Room not found or removed.")
+        with right:
+            st.subheader("💬 Table Chat")
+            st.info("Room not found.")
         return
 
     # Ensure code exists and URL reflects (room, uid)
@@ -390,228 +402,262 @@ def main():
     update_heartbeat(room, user_id)
     room = get_room(room_code)
 
-    st.subheader(f"Room {room['code']} — {room['status']}")
-    st.caption(f"Dealer: {room['users'][dealer_id]['name'] if dealer_id else '-'} | Players: {len(room['users']) - (1 if dealer_id else 0)}")
+    # ======= Left: Game UI =======
+    with left:
+        st.subheader(f"Room {room['code']} — {room['status']}")
+        st.caption(f"Dealer: {room['users'][dealer_id]['name'] if dealer_id else '-'} | Players: {len(room['users']) - (1 if dealer_id else 0)}")
 
-    # LOBBY
-    if room["status"] == "lobby":
-        st.markdown("**Players**")
-        for uid, u in room["users"].items():
-            ready_txt = " ✅ Ready" if u.get("ready") else ""
-            role_txt = " (Dealer)" if uid == dealer_id else ""
-            live_txt = "🟢 Active" if is_active(u) else "🟡 Away"
-            st.write(f"👤 {u['name']}{role_txt} — bankroll {u.get('bankroll', 1000)} — {live_txt}{ready_txt}")
-
-        st.divider()
-        st.markdown("#### My settings")
-        me = room["users"][user_id]
-        # clamp bet
-        try:
-            current_bet = int(me.get("bet", 10))
-        except Exception:
-            current_bet = 10
-        if current_bet < 1:
-            current_bet = 10
-        bet_val = st.number_input("My bet", min_value=1, value=int(current_bet), step=1, key=f"bet_{user_id}")
-        ready_val = st.toggle("I'm ready", value=bool(me.get("ready", False)), key=f"ready_{user_id}")
-        if int(bet_val) != me.get("bet") or bool(ready_val) != me.get("ready"):
-            me["bet"] = int(bet_val); me["ready"] = bool(ready_val)
-            save_room(room); room = get_room(room_code)
-
-        # Dealer claim/reclaim
-        if dealer_id is None and st.button("Become Dealer", key=f"btn_dealer_{room_code}"):
-            room = get_room(room_code)
-            room["dealer"] = user_id
-            save_room(room)
-            st.rerun()
-
-        # Show my reconnect link token
-        st.caption(f"Your reconnect token: `{user_id}` — bookmark this page (URL now includes `?room={room_code}&uid={user_id}`)")
-
-        if user_id == dealer_id and st.button("Start Round", key=f"btn_start_{room_code}"):
-            latest = get_room(room_code)
-            if not latest:
-                st.error("Room missing")
-            else:
-                ready_players = [uid for uid, u in latest["users"].items() if uid != dealer_id and u.get("ready")]
-                if not ready_players:
-                    st.warning("No ready players yet.")
-                else:
-                    latest["deck"] = list(range(1, 53)); random.shuffle(latest["deck"])
-                    latest["last_results"] = []; latest["settled_players"] = []
-                    # reset + deal
-                    for uid, u in latest["users"].items():
-                        u["hand"] = []; u["acted"] = False
-                        try:
-                            if int(u.get("bet", 0)) < 1: u["bet"] = 10
-                        except Exception:
-                            u["bet"] = 10
-                    for uid in ready_players:
-                        latest["users"][uid]["hand"] = [draw_card(latest), draw_card(latest)]
-                        # player Pok -> acted immediately (lock)
-                        p_pok, _ = is_pok(latest["users"][uid]["hand"])
-                        if p_pok: latest["users"][uid]["acted"] = True
-                    if dealer_id:
-                        latest["users"][dealer_id]["hand"] = [draw_card(latest), draw_card(latest)]
-                        # Dealer Pok right after deal -> settle entire table now
-                        d_pok, _ = is_pok(latest["users"][dealer_id]["hand"])
-                        if d_pok:
-                            remaining = ready_players[:]  # all seated players
-                            if remaining:
-                                settle_players(latest, remaining)
-                            latest["status"] = "settlement"
-                            for uid in ready_players: latest["users"][uid]["ready"] = False
-                            save_room(latest); st.rerun()
-                    latest["status"] = "player_action"
-                    latest["order"] = ready_players
-                    for uid in ready_players: latest["users"][uid]["ready"] = False
-                    save_room(latest); st.rerun()
-
-    # PLAYER ACTION
-    elif room["status"] == "player_action":
-        st.markdown("### Players decide")
-        if dealer_id:
-            dealer_hand = room["users"][dealer_id]["hand"]
-            if user_id == dealer_id:
-                d_lbl = mult_label(dealer_hand)
-                st.write(f"Dealer: {hand_to_str(dealer_hand)} ({hand_points(dealer_hand)} pts){d_lbl}")
-            else:
-                st.write(f"Dealer: {facedown_str(len(dealer_hand))}")
-
-        for uid in room["order"]:
-            u = room["users"][uid]
-            tag = " (me)" if uid == user_id else ""
-            p_pok, _ = is_pok(u["hand"]) if len(u["hand"]) == 2 else (False, 0)
-            pok_badge = " 🔥 Pok!" if p_pok else ""
-            if uid == user_id:
-                p_lbl = mult_label(u["hand"])
-                st.write(f"👤 {u['name']}{tag} — {hand_to_str(u['hand'])} ({hand_points(u['hand'])} pts){p_lbl}{pok_badge}")
-                c1, c2 = st.columns(2)
-                if c1.button("Stay", key=f"btn_stay_{uid}") and not u.get("acted"):
-                    latest = get_room(room_code); latest["users"][uid]["acted"] = True; save_room(latest); st.rerun()
-                if c2.button("Draw", key=f"btn_draw_{uid}") and len(u["hand"]) < 3 and not u.get("acted") and not p_pok:
-                    latest = get_room(room_code); latest["users"][uid]["hand"].append(draw_card(latest)); latest["users"][uid]["acted"] = True; save_room(latest); st.rerun()
-            else:
-                status_txt = "✅ Acted" if u.get("acted") else "⌛ Waiting"
-                st.write(f"👤 {u['name']}{tag} — {facedown_str(len(u['hand']))} — {status_txt}{pok_badge}")
-
-        latest = get_room(room_code)
-        if latest and all(latest["users"][uid].get("acted") for uid in latest["order"]):
-            latest["status"] = "dealer_action"; save_room(latest); st.rerun()
-
-    # DEALER ACTION
-    elif room["status"] == "dealer_action":
-        st.markdown("### Dealer Phase")
-        dealer = room["users"].get(room.get("dealer")) if room.get("dealer") else None
-        dealer_id = room.get("dealer")
-        if not dealer:
-            st.warning("No dealer assigned. Back to lobby?")
-        else:
-            d_pok, _ = is_pok(dealer["hand"]) if len(dealer["hand"]) == 2 else (False, 0)
-
-            if user_id == dealer_id:
-                d_lbl = mult_label(dealer["hand"])
-                extra = " 🔥 Pok!" if d_pok else ""
-                st.write(f"Dealer: {hand_to_str(dealer['hand'])} ({hand_points(dealer['hand'])} pts){d_lbl}{extra}")
-            else:
-                st.write(f"Dealer: {facedown_str(len(dealer['hand']))}")
-
-            # If dealer has Pok now → auto-settle all remaining and end
-            if user_id == dealer_id and d_pok:
-                latest = get_room(room_code)
-                remaining = [uid for uid in latest["order"] if uid not in latest.get("settled_players", [])]
-                if remaining: settle_players(latest, remaining)
-                latest["status"] = "settlement"; save_room(latest); st.rerun()
-
+        # LOBBY
+        if room["status"] == "lobby":
             st.markdown("**Players**")
+            for uid, u in room["users"].items():
+                ready_txt = " ✅ Ready" if u.get("ready") else ""
+                role_txt = " (Dealer)" if uid == dealer_id else ""
+                live_txt = "🟢 Active" if is_active(u) else "🟡 Away"
+                st.write(f"👤 {u['name']}{role_txt} — bankroll {u.get('bankroll', 1000)} — {live_txt}{ready_txt}")
+
+            st.divider()
+            st.markdown("#### My settings")
+            me = room["users"][user_id]
+            # clamp bet
+            try:
+                current_bet = int(me.get("bet", 10))
+            except Exception:
+                current_bet = 10
+            if current_bet < 1:
+                current_bet = 10
+            bet_val = st.number_input("My bet", min_value=1, value=int(current_bet), step=1, key=f"bet_{user_id}")
+            ready_val = st.toggle("I'm ready", value=bool(me.get("ready", False)), key=f"ready_{user_id}")
+            if int(bet_val) != me.get("bet") or bool(ready_val) != me.get("ready"):
+                me["bet"] = int(bet_val); me["ready"] = bool(ready_val)
+                save_room(room); room = get_room(room_code)
+
+            # Dealer claim/reclaim
+            if dealer_id is None and st.button("Become Dealer", key=f"btn_dealer_{room_code}"):
+                room = get_room(room_code)
+                room["dealer"] = user_id
+                save_room(room)
+                st.rerun()
+
+            # Reconnect link token
+            st.caption(f"Your reconnect token: `{user_id}` — bookmark this page (URL now includes `?room={room_code}&uid={user_id}`)")
+
+            if user_id == dealer_id and st.button("Start Round", key=f"btn_start_{room_code}"):
+                latest = get_room(room_code)
+                if not latest:
+                    st.error("Room missing")
+                else:
+                    ready_players = [uid for uid, u in latest["users"].items() if uid != dealer_id and u.get("ready")]
+                    if not ready_players:
+                        st.warning("No ready players yet.")
+                    else:
+                        latest["deck"] = list(range(1, 53)); random.shuffle(latest["deck"])
+                        latest["last_results"] = []; latest["settled_players"] = []
+                        latest["chat"] = []  # 🔄 clear chat each round start
+                        # reset + deal
+                        for uid, u in latest["users"].items():
+                            u["hand"] = []; u["acted"] = False
+                            try:
+                                if int(u.get("bet", 0)) < 1: u["bet"] = 10
+                            except Exception:
+                                u["bet"] = 10
+                        for uid in ready_players:
+                            latest["users"][uid]["hand"] = [draw_card(latest), draw_card(latest)]
+                            # player Pok -> acted immediately (lock)
+                            p_pok, _ = is_pok(latest["users"][uid]["hand"])
+                            if p_pok: latest["users"][uid]["acted"] = True
+                        if dealer_id:
+                            latest["users"][dealer_id]["hand"] = [draw_card(latest), draw_card(latest)]
+                            # Dealer Pok right after deal -> settle entire table now
+                            d_pok, _ = is_pok(latest["users"][dealer_id]["hand"])
+                            if d_pok:
+                                remaining = ready_players[:]  # all seated players
+                                if remaining:
+                                    settle_players(latest, remaining)
+                                latest["status"] = "settlement"
+                                for uid in ready_players: latest["users"][uid]["ready"] = False
+                                save_room(latest); st.rerun()
+                        latest["status"] = "player_action"
+                        latest["order"] = ready_players
+                        for uid in ready_players: latest["users"][uid]["ready"] = False
+                        save_room(latest); st.rerun()
+
+        # PLAYER ACTION
+        elif room["status"] == "player_action":
+            st.markdown("### Players decide")
+            if dealer_id:
+                dealer_hand = room["users"][dealer_id]["hand"]
+                if user_id == dealer_id:
+                    d_lbl = mult_label(dealer_hand)
+                    st.write(f"Dealer: {hand_to_str(dealer_hand)} ({hand_points(dealer_hand)} pts){d_lbl}")
+                else:
+                    st.write(f"Dealer: {facedown_str(len(dealer_hand))}")
+
             for uid in room["order"]:
                 u = room["users"][uid]
                 tag = " (me)" if uid == user_id else ""
-                settled_badge = " ✅ Settled" if uid in room.get("settled_players", []) else ""
                 p_pok, _ = is_pok(u["hand"]) if len(u["hand"]) == 2 else (False, 0)
-                pok_b = " 🔥 Pok!" if p_pok else ""
+                pok_badge = " 🔥 Pok!" if p_pok else ""
                 if uid == user_id:
                     p_lbl = mult_label(u["hand"])
-                    st.write(f"👤 {u['name']}{tag} — {hand_to_str(u['hand'])} ({hand_points(u['hand'])} pts){p_lbl}{pok_b}{settled_badge}")
+                    st.write(f"👤 {u['name']}{tag} — {hand_to_str(u['hand'])} ({hand_points(u['hand'])} pts){p_lbl}{pok_badge}")
+                    c1, c2 = st.columns(2)
+                    if c1.button("Stay", key=f"btn_stay_{uid}") and not u.get("acted"):
+                        latest = get_room(room_code); latest["users"][uid]["acted"] = True; save_room(latest); st.rerun()
+                    if c2.button("Draw", key=f"btn_draw_{uid}") and len(u["hand"]) < 3 and not u.get("acted") and not p_pok:
+                        latest = get_room(room_code); latest["users"][uid]["hand"].append(draw_card(latest)); latest["users"][uid]["acted"] = True; save_room(latest); st.rerun()
                 else:
-                    st.write(f"👤 {u['name']}{tag} — {facedown_str(len(u['hand']))}{settled_badge}{pok_b}")
+                    status_txt = "✅ Acted" if u.get("acted") else "⌛ Waiting"
+                    st.write(f"👤 {u['name']}{tag} — {facedown_str(len(u['hand']))} — {status_txt}{pok_badge}")
 
-            # AUTO: settle all 2-card Pok players first (dealer not Pok)
-            if user_id == dealer_id and not d_pok:
-                latest = get_room(room_code)
-                pok_targets = [uid for uid in latest["order"]
-                               if uid not in latest.get("settled_players", [])
-                               and len(latest["users"][uid]["hand"]) == 2
-                               and is_pok(latest["users"][uid]["hand"])[0]]
-                if pok_targets:
-                    settle_players(latest, pok_targets)
-                    save_room(latest)
-                    st.rerun()
+            latest = get_room(room_code)
+            if latest and all(latest["users"][uid].get("acted") for uid in latest["order"]):
+                latest["status"] = "dealer_action"; save_room(latest); st.rerun()
 
-                st.divider()
-                st.markdown("#### Dealer controls")
-                latest = get_room(room_code)
-                pending_3 = len([uid for uid in latest["order"]
-                                 if len(latest["users"][uid]["hand"]) == 3 and uid not in latest.get("settled_players", [])])
-                c1, c2, c3, c4 = st.columns(4)
-                if c1.button(f"Settle vs 3-card players ({pending_3})", key=f"btn_settle3_{room_code}"):
-                    latest = get_room(room_code)
-                    targets = [uid for uid in latest["order"]
-                               if len(latest["users"][uid]["hand"]) == 3 and uid not in latest.get("settled_players", [])]
-                    if targets: settle_players(latest, targets); save_room(latest)
-                    else: st.info("No 3-card players to settle right now.")
-                    st.rerun()
-                if c2.button("Dealer Draw", key=f"btn_ddraw_{room_code}"):
-                    latest = get_room(room_code)
-                    if len(latest["users"][dealer_id]["hand"]) < 3:
-                        latest["users"][dealer_id]["hand"].append(draw_card(latest)); save_room(latest)
-                    st.rerun()
-                if c3.button("Settle Remaining", key=f"btn_settlerest_{room_code}"):
+        # DEALER ACTION
+        elif room["status"] == "dealer_action":
+            st.markdown("### Dealer Phase")
+            dealer = room["users"].get(room.get("dealer")) if room.get("dealer") else None
+            dealer_id = room.get("dealer")
+            if not dealer:
+                st.warning("No dealer assigned. Back to lobby?")
+            else:
+                d_pok, _ = is_pok(dealer["hand"]) if len(dealer["hand"]) == 2 else (False, 0)
+
+                if user_id == dealer_id:
+                    d_lbl = mult_label(dealer["hand"])
+                    extra = " 🔥 Pok!" if d_pok else ""
+                    st.write(f"Dealer: {hand_to_str(dealer['hand'])} ({hand_points(dealer['hand'])} pts){d_lbl}{extra}")
+                else:
+                    st.write(f"Dealer: {facedown_str(len(dealer['hand']))}")
+
+                # If dealer has Pok now → auto-settle all remaining and end
+                if user_id == dealer_id and d_pok:
                     latest = get_room(room_code)
                     remaining = [uid for uid in latest["order"] if uid not in latest.get("settled_players", [])]
                     if remaining: settle_players(latest, remaining)
                     latest["status"] = "settlement"; save_room(latest); st.rerun()
-                if c4.button("Back to Lobby", key=f"btn_back_dealer_{room_code}"):
+
+                st.markdown("**Players**")
+                for uid in room["order"]:
+                    u = room["users"][uid]
+                    tag = " (me)" if uid == user_id else ""
+                    settled_badge = " ✅ Settled" if uid in room.get("settled_players", []) else ""
+                    p_pok, _ = is_pok(u["hand"]) if len(u["hand"]) == 2 else (False, 0)
+                    pok_b = " 🔥 Pok!" if p_pok else ""
+                    if uid == user_id:
+                        p_lbl = mult_label(u["hand"])
+                        st.write(f"👤 {u['name']}{tag} — {hand_to_str(u['hand'])} ({hand_points(u['hand'])} pts){p_lbl}{pok_b}{settled_badge}")
+                    else:
+                        st.write(f"👤 {u['name']}{tag} — {facedown_str(len(u['hand']))}{settled_badge}{pok_b}")
+
+                # AUTO: settle all 2-card Pok players first (dealer not Pok)
+                if user_id == dealer_id and not d_pok:
                     latest = get_room(room_code)
-                    for uid in latest["users"]:
-                        latest["users"][uid]["hand"] = []; latest["users"][uid]["acted"] = False; latest["users"][uid]["ready"] = False
-                    latest["status"] = "lobby"; latest["last_results"] = []; latest["settled_players"] = []; save_room(latest); st.rerun()
-            elif user_id != dealer_id:
-                st.write("Waiting for dealer decisions…")
+                    pok_targets = [uid for uid in latest["order"]
+                                   if uid not in latest.get("settled_players", [])
+                                   and len(latest["users"][uid]["hand"]) == 2
+                                   and is_pok(latest["users"][uid]["hand"])[0]]
+                    if pok_targets:
+                        settle_players(latest, pok_targets)
+                        save_room(latest)
+                        st.rerun()
 
-            if room.get("last_results"):
-                st.divider()
-                st.markdown("#### Results so far")
-                for res in room["last_results"]:
-                    pl = f" {res['player_mult_label']}" if res.get("player_mult_label") else ""
-                    dl = f" {res['dealer_mult_label']}" if res.get("dealer_mult_label") else ""
-                    st.write(f"{room['users'][res['player_id']]['name']}: {res['outcome']} (payout {res['payout']}) — P{pl} vs D{dl}")
+                    st.divider()
+                    st.markdown("#### Dealer controls")
+                    latest = get_room(room_code)
+                    pending_3 = len([uid for uid in latest["order"]
+                                     if len(latest["users"][uid]["hand"]) == 3 and uid not in latest.get("settled_players", [])])
+                    c1, c2, c3, c4 = st.columns(4)
+                    if c1.button(f"Settle vs 3-card players ({pending_3})", key=f"btn_settle3_{room_code}"):
+                        latest = get_room(room_code)
+                        targets = [uid for uid in latest["order"]
+                                   if len(latest["users"][uid]["hand"]) == 3 and uid not in latest.get("settled_players", [])]
+                        if targets: settle_players(latest, targets); save_room(latest)
+                        else: st.info("No 3-card players to settle right now.")
+                        st.rerun()
+                    if c2.button("Dealer Draw", key=f"btn_ddraw_{room_code}"):
+                        latest = get_room(room_code)
+                        if len(latest["users"][dealer_id]["hand"]) < 3:
+                            latest["users"][dealer_id]["hand"].append(draw_card(latest)); save_room(latest)
+                        st.rerun()
+                    if c3.button("Settle Remaining", key=f"btn_settlerest_{room_code}"):
+                        latest = get_room(room_code)
+                        remaining = [uid for uid in latest["order"] if uid not in latest.get("settled_players", [])]
+                        if remaining: settle_players(latest, remaining)
+                        latest["status"] = "settlement"; save_room(latest); st.rerun()
+                    if c4.button("Back to Lobby", key=f"btn_back_dealer_{room_code}"):
+                        latest = get_room(room_code)
+                        for uid in latest["users"]:
+                            latest["users"][uid]["hand"] = []; latest["users"][uid]["acted"] = False; latest["users"][uid]["ready"] = False
+                        latest["status"] = "lobby"; latest["last_results"] = []; latest["settled_players"] = []; save_room(latest); st.rerun()
+                elif user_id != dealer_id:
+                    st.write("Waiting for dealer decisions…")
 
-    # SETTLEMENT
-    elif room["status"] == "settlement":
-        st.markdown("### Showdown")
-        dealer_id = room["dealer"]
-        dealer = room["users"][dealer_id]
-        d_lbl = mult_label(dealer["hand"])
-        st.write(f"Dealer: {hand_to_str(dealer['hand'])} ({hand_points(dealer['hand'])} pts){d_lbl}")
-        for uid in room["order"]:
-            u = room["users"][uid]
-            p_lbl = mult_label(u["hand"])
-            st.write(f"👤 {u['name']} — {hand_to_str(u['hand'])} ({hand_points(u['hand'])} pts){p_lbl}")
+                if room.get("last_results"):
+                    st.divider()
+                    st.markdown("#### Results so far")
+                    for res in room["last_results"]:
+                        pl = f" {res['player_mult_label']}" if res.get("player_mult_label") else ""
+                        dl = f" {res['dealer_mult_label']}" if res.get("dealer_mult_label") else ""
+                        st.write(f"{room['users'][res['player_id']]['name']}: {res['outcome']} (payout {res['payout']}) — P{pl} vs D{dl}")
 
-        st.divider()
-        st.markdown("**Results**")
-        for res in room.get("last_results", []):
-            player = room["users"][res["player_id"]]
-            pl = f" {res['player_mult_label']}" if res.get("player_mult_label") else ""
-            dl = f" {res['dealer_mult_label']}" if res.get("dealer_mult_label") else ""
-            st.write(f"{player['name']} — {res['outcome']} (payout {res['payout']}) — P{pl} vs D{dl}")
+        # SETTLEMENT
+        elif room["status"] == "settlement":
+            st.markdown("### Showdown")
+            dealer_id = room["dealer"]
+            dealer = room["users"][dealer_id]
+            d_lbl = mult_label(dealer["hand"])
+            st.write(f"Dealer: {hand_to_str(dealer['hand'])} ({hand_points(dealer['hand'])} pts){d_lbl}")
+            for uid in room["order"]:
+                u = room["users"][uid]
+                p_lbl = mult_label(u["hand"])
+                st.write(f"👤 {u['name']} — {hand_to_str(u['hand'])} ({hand_points(u['hand'])} pts){p_lbl}")
 
-        if st.button("Back to Lobby", key=f"btn_back_settlement_{room_code}"):
-            latest = get_room(room_code)
-            for uid in latest["users"]:
-                latest["users"][uid]["hand"] = []; latest["users"][uid]["acted"] = False; latest["users"][uid]["ready"] = False
-            latest["status"] = "lobby"; latest["last_results"] = []; latest["settled_players"] = []; save_room(latest); st.rerun()
+            st.divider()
+            st.markdown("**Results**")
+            for res in room.get("last_results", []):
+                player = room["users"][res["player_id"]]
+                pl = f" {res['player_mult_label']}" if res.get("player_mult_label") else ""
+                dl = f" {res['dealer_mult_label']}" if res.get("dealer_mult_label") else ""
+                st.write(f"{player['name']} — {res['outcome']} (payout {res['payout']}) — P{pl} vs D{dl}")
+
+            if st.button("Back to Lobby", key=f"btn_back_settlement_{room_code}"):
+                latest = get_room(room_code)
+                for uid in latest["users"]:
+                    latest["users"][uid]["hand"] = []; latest["users"][uid]["acted"] = False; latest["users"][uid]["ready"] = False
+                latest["status"] = "lobby"; latest["last_results"] = []; latest["settled_players"] = []; save_room(latest); st.rerun()
+
+    # ======= Right: Real-time Chat =======
+    with right:
+        st.subheader("💬 Table Chat")
+        room = get_room(room_code)  # refresh to reflect new messages, if any
+        chat = room.get("chat", [])
+        # Show last 100 messages (newest at bottom)
+        for msg in chat[-100:]:
+            ts = datetime.datetime.fromtimestamp(msg.get("ts", int(time.time()))).strftime("%H:%M:%S")
+            # Use chat bubbles
+            with st.chat_message("user"):
+                st.markdown(f"**{msg.get('name','?')}** · {ts}\n\n{msg.get('text','')}")
+
+    # Chat input (fixed at bottom of the page). Only render if in a room.
+    message = st.chat_input("Type a message")
+    if message and room_code:
+        latest = get_room(room_code)
+        latest.setdefault("chat", [])
+        # prepare sender name
+        sender_name = latest["users"].get(user_id, {}).get("name", "Player")
+        latest["chat"].append({
+            "uid": user_id,
+            "name": sender_name,
+            "text": message.strip(),
+            "ts": int(time.time())
+        })
+        # cap chat history
+        if len(latest["chat"]) > 200:
+            latest["chat"] = latest["chat"][-200:]
+        save_room(latest)
+        st.rerun()
 
 if __name__ == "__main__":
     main()
