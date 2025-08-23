@@ -1,15 +1,15 @@
-# app.py — Pok Deng (ป๊อกเด้ง) Multiplayer — file-backed, with Pok & Deng rules + auto-settle + labels
-# New in this version:
-#  - Shows multiplier labels next to each hand (e.g., "2 เด้ง", "3 เด้ง", "ตอง") in Player, Dealer, and Settlement views
-#  - Results list includes multiplier labels for both player and dealer at time of settlement
+# app.py — Pok Deng (ป๊อกเด้ง) Multiplayer — file-backed, identity persistence, Pok & Deng rules
+# Highlights:
+# - Identity persistence: ?room=CODE&uid=TOKEN via st.query_params; reclaim-by-name on Join
+# - Heartbeat presence: last_seen; lobby shows 🟢 Active / 🟡 Away
+# - Full Pok & Deng rules; winner’s multiplier applies
+# - Auto-actions: player Pok (8/9) auto-acts; dealer Pok (8/9) auto-settles entire table
+# - Partial settlement flow: settle 3-card first, dealer draw, settle remaining
+# - Multiplier labels in UI (2 เด้ง, 3 เด้ง, ตอง, etc.) & results list
+# - Unique widget keys; auto-refresh every 5s
 #
-# Features kept:
-#  - File-backed JSON storage with file lock
-#  - Lobby with bet (>=1), ready toggle; dealer starts only if at least one ready
-#  - Hidden info, partial settlement (3-card first), results-so-far, unique keys
-#  - Full Pok & Deng rules; winner’s multiplier applies
-#  - Auto-actions: player Pok auto-acts; dealer Pok auto-settles & ends round
-#  - Auto-refresh every 5s
+# Requirements:
+#   pip install streamlit==1.48.1 streamlit-autorefresh==1.0.1 filelock==3.15.4
 
 import os, json, time, uuid, random
 from typing import Dict, List, Optional, Tuple
@@ -147,7 +147,6 @@ def deng_multiplier(hand: List[int]) -> Tuple[int, str]:
     return 1, "x1"
 
 def mult_label(hand: List[int]) -> str:
-    """Helper to show a nice label (no 'x1' clutter)."""
     m, lbl = deng_multiplier(hand)
     return "" if m == 1 else f" — {lbl}"
 
@@ -230,6 +229,30 @@ def settle_players(room: Dict, target_uids: List[str]) -> List[Dict]:
     return results
 
 # =========================
+# Identity helpers
+# =========================
+ACTIVE_WINDOW = 20  # seconds to consider "Active"
+
+def normalize_name(x: str) -> str:
+    return (x or "").strip().lower()
+
+def find_user_by_name(room: Dict, name: str) -> Optional[str]:
+    target = normalize_name(name)
+    for uid, u in room.get("users", {}).items():
+        if normalize_name(u.get("name")) == target:
+            return uid
+    return None
+
+def update_heartbeat(room: Dict, uid: str) -> None:
+    if uid in room.get("users", {}):
+        room["users"][uid]["last_seen"] = int(time.time())
+        save_room(room)
+
+def is_active(u: Dict) -> bool:
+    ts = u.get("last_seen", 0)
+    return (int(time.time()) - int(ts)) <= ACTIVE_WINDOW
+
+# =========================
 # App
 # =========================
 POLL_INTERVAL_MS = 2000  # 5s
@@ -238,9 +261,14 @@ def main():
     st.set_page_config(page_title="Pok Deng — Multiplayer", page_icon="🎴", layout="wide")
     st_autorefresh(interval=POLL_INTERVAL_MS, key="pokdeng-refresh")
 
-    # Identity
+    # Reclaim identity from URL params (new API)
+    params = st.query_params
+    url_uid = params.get("uid")
+    url_room = params.get("room")
+
+    # Session identity
     if "user_id" not in st.session_state:
-        st.session_state.user_id = uuid.uuid4().hex
+        st.session_state.user_id = url_uid or uuid.uuid4().hex
     user_id = st.session_state.user_id
 
     st.title("🎴 Pok Deng — Multiplayer")
@@ -251,7 +279,7 @@ def main():
         st.header("Join or Create")
         name = st.text_input("Your name", value=st.session_state.get("display_name", "Player"))
         st.session_state["display_name"] = name
-        room_code = st.text_input("Room code", value=st.session_state.get("room_code", "")).upper()
+        room_code = st.text_input("Room code", value=st.session_state.get("room_code", url_room or "")).upper()
 
         c1, c2 = st.columns(2)
         if c1.button("Create", key="btn_create"):
@@ -274,6 +302,12 @@ def main():
                 }
                 save_room(room)
                 st.session_state["room_code"] = room_code
+                # write query params
+                try:
+                    st.query_params["room"] = room_code
+                    st.query_params["uid"] = user_id
+                except Exception:
+                    pass
                 st.success(f"Room {room_code} created.")
                 st.rerun()
         if c2.button("Join", key="btn_join"):
@@ -284,21 +318,39 @@ def main():
                 if not room:
                     st.error("Room not found. Create it first.")
                 else:
-                    st.session_state["room_code"] = room_code
-                    if user_id not in room.get("users", {}):
-                        room["users"][user_id] = {
+                    # Try reclaim by name
+                    existing_uid = find_user_by_name(room, name)
+                    if existing_uid:
+                        st.session_state["user_id"] = existing_uid
+                        user_id_new = existing_uid
+                        room["users"].setdefault(user_id_new, {
                             "name": name, "bankroll": 1000, "hand": [],
                             "bet": 10, "acted": False, "ready": False
-                        }
+                        })
+                        room["users"][user_id_new]["name"] = name
                         save_room(room)
                     else:
-                        room["users"][user_id]["name"] = name
-                        save_room(room)
+                        # create if not exists
+                        if user_id not in room.get("users", {}):
+                            room["users"][user_id] = {
+                                "name": name, "bankroll": 1000, "hand": [],
+                                "bet": 10, "acted": False, "ready": False
+                            }
+                            save_room(room)
+                        else:
+                            room["users"][user_id]["name"] = name
+                            save_room(room)
+                    st.session_state["room_code"] = room_code
+                    try:
+                        st.query_params["room"] = room_code
+                        st.query_params["uid"] = st.session_state["user_id"]
+                    except Exception:
+                        pass
                     st.success(f"Joined room {room_code}.")
                     st.rerun()
 
     # Need a room
-    room_code = st.session_state.get("room_code")
+    room_code = st.session_state.get("room_code") or url_room
     if not room_code:
         st.info("Enter a room code and click Create or Join.")
         return
@@ -308,21 +360,35 @@ def main():
         st.error("Room not found or removed.")
         return
 
-    # Ensure code exists
+    # Ensure code exists and URL reflects (room, uid)
     if "code" not in room:
         room["code"] = room_code
         save_room(room)
+    try:
+        st.query_params["room"] = room_code
+        st.query_params["uid"] = st.session_state.user_id
+    except Exception:
+        pass
 
-    # Ensure this user exists
-    if user_id not in room["users"]:
-        room["users"][user_id] = {
-            "name": st.session_state.get("display_name", "Player"),
-            "bankroll": 1000, "hand": [], "bet": 10, "acted": False, "ready": False
-        }
-        save_room(room)
+    # Ensure this user exists (reclaim by URL uid if needed)
+    if st.session_state.user_id not in room["users"]:
+        existing_uid = find_user_by_name(room, st.session_state.get("display_name", "Player"))
+        if existing_uid:
+            st.session_state.user_id = existing_uid
+        else:
+            room["users"][st.session_state.user_id] = {
+                "name": st.session_state.get("display_name", "Player"),
+                "bankroll": 1000, "hand": [], "bet": 10, "acted": False, "ready": False
+            }
+            save_room(room)
         room = get_room(room_code)
 
+    user_id = st.session_state.user_id
     dealer_id = room.get("dealer")
+
+    # Heartbeat
+    update_heartbeat(room, user_id)
+    room = get_room(room_code)
 
     st.subheader(f"Room {room['code']} — {room['status']}")
     st.caption(f"Dealer: {room['users'][dealer_id]['name'] if dealer_id else '-'} | Players: {len(room['users']) - (1 if dealer_id else 0)}")
@@ -333,7 +399,8 @@ def main():
         for uid, u in room["users"].items():
             ready_txt = " ✅ Ready" if u.get("ready") else ""
             role_txt = " (Dealer)" if uid == dealer_id else ""
-            st.write(f"👤 {u['name']}{role_txt} — bankroll {u.get('bankroll', 1000)}{ready_txt}")
+            live_txt = "🟢 Active" if is_active(u) else "🟡 Away"
+            st.write(f"👤 {u['name']}{role_txt} — bankroll {u.get('bankroll', 1000)} — {live_txt}{ready_txt}")
 
         st.divider()
         st.markdown("#### My settings")
@@ -351,11 +418,15 @@ def main():
             me["bet"] = int(bet_val); me["ready"] = bool(ready_val)
             save_room(room); room = get_room(room_code)
 
+        # Dealer claim/reclaim
         if dealer_id is None and st.button("Become Dealer", key=f"btn_dealer_{room_code}"):
             room = get_room(room_code)
             room["dealer"] = user_id
             save_room(room)
             st.rerun()
+
+        # Show my reconnect link token
+        st.caption(f"Your reconnect token: `{user_id}` — bookmark this page (URL now includes `?room={room_code}&uid={user_id}`)")
 
         if user_id == dealer_id and st.button("Start Round", key=f"btn_start_{room_code}"):
             latest = get_room(room_code)
@@ -431,7 +502,8 @@ def main():
     # DEALER ACTION
     elif room["status"] == "dealer_action":
         st.markdown("### Dealer Phase")
-        dealer = room["users"].get(dealer_id) if dealer_id else None
+        dealer = room["users"].get(room.get("dealer")) if room.get("dealer") else None
+        dealer_id = room.get("dealer")
         if not dealer:
             st.warning("No dealer assigned. Back to lobby?")
         else:
@@ -444,7 +516,7 @@ def main():
             else:
                 st.write(f"Dealer: {facedown_str(len(dealer['hand']))}")
 
-            # If dealer has Pok now (safety) → auto-settle all remaining and end
+            # If dealer has Pok now → auto-settle all remaining and end
             if user_id == dealer_id and d_pok:
                 latest = get_room(room_code)
                 remaining = [uid for uid in latest["order"] if uid not in latest.get("settled_players", [])]
